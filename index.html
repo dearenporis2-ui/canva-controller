@@ -440,15 +440,46 @@
     const wsUrl = `wss://socketsbay.com/wss/v2/1/${code}-slideremote/`;
     ws = new WebSocket(wsUrl);
 
+    // FIX 1: Don't show remote screen immediately on WS open.
+    // Instead, send a hello and wait for the PC to respond (pc-ack).
+    // If no ack in 5s, the room code is wrong or PC isn't running.
+    let handshakeTimer = null;
+    let handshakeDone = false;
+
     ws.onopen = () => {
-      showRemote();
+      // Send hello to PC — if it's in this room it'll reply with pc-ack
+      ws.send(JSON.stringify({ type: "phone-hello" }));
+      // Also check if PC already announced itself (pc-online broadcast)
+      handshakeTimer = setTimeout(() => {
+        if (!handshakeDone) {
+          joinError.textContent = "No PC found with that code. Is the extension running?";
+          joinBtn.disabled = false;
+          joinBtn.textContent = "Connect";
+          ws.close();
+        }
+      }, 5000);
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        // PC confirmed it's there
+        if ((data.type === "pc-ack" || data.type === "pc-online") && !handshakeDone) {
+          handshakeDone = true;
+          clearTimeout(handshakeTimer);
+          showRemote();
+          return;
+        }
+      } catch (e) {}
     };
 
     ws.onclose = () => {
+      clearTimeout(handshakeTimer);
       setConnStatus(false);
     };
 
     ws.onerror = () => {
+      clearTimeout(handshakeTimer);
       joinError.textContent = "Could not connect. Check the code.";
       joinBtn.disabled = false;
       joinBtn.textContent = "Connect";
