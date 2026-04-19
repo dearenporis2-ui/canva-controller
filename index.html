@@ -378,138 +378,120 @@
   </div>
 </div>
 
+<!-- Ably realtime SDK — gives instant push messages, no polling needed -->
+<script src="https://cdn.ably.com/lib/ably.min-2.js"></script>
 <script>
-  // !! Replace this with your Ably API key from https://ably.com (free account)
+  // !! Replace with your Ably API key from https://ably.com (free account)
   const ABLY_API_KEY = "HtCWNA.nyttHg:Zq7f8ZfaTm-7zrzR_CoqWKPVIRiBNb43r2h6nE1IObo";
 
-  const joinScreen = document.getElementById("joinScreen");
+  const joinScreen  = document.getElementById("joinScreen");
   const remoteScreen = document.getElementById("remoteScreen");
-  const joinBtn = document.getElementById("joinBtn");
-  const joinError = document.getElementById("joinError");
-  const connDot = document.getElementById("connDot");
-  const connLabel = document.getElementById("connLabel");
-  const flash = document.getElementById("flash");
+  const joinBtn     = document.getElementById("joinBtn");
+  const joinError   = document.getElementById("joinError");
+  const connDot     = document.getElementById("connDot");
+  const connLabel   = document.getElementById("connLabel");
+  const flash       = document.getElementById("flash");
 
-  const digits = [
-    document.getElementById("d1"),
-    document.getElementById("d2"),
-    document.getElementById("d3"),
-    document.getElementById("d4")
-  ];
+  const digits = ["d1","d2","d3","d4"].map(id => document.getElementById(id));
 
-  let roomCode = null;
-  let pollInterval = null;
-  let lastSerial = null;
-  let connected = false;
+  let ablyClient = null;
+  let channel    = null;
+  let roomCode   = null;
+  let connected  = false;
 
+  // ── Digit input ──
   digits.forEach((box, i) => {
-    box.addEventListener("input", (e) => {
-      const val = e.target.value.replace(/\D/g, "");
-      e.target.value = val.slice(-1);
-      if (val && i < 3) digits[i + 1].focus();
-      checkCode();
+    box.addEventListener("input", e => {
+      const v = e.target.value.replace(/\D/g, "");
+      e.target.value = v.slice(-1);
+      if (v && i < 3) digits[i+1].focus();
+      joinBtn.disabled = digits.map(d => d.value).join("").length < 4;
     });
-    box.addEventListener("keydown", (e) => {
+    box.addEventListener("keydown", e => {
       if (e.key === "Backspace" && !box.value && i > 0) {
-        digits[i - 1].focus();
-        digits[i - 1].value = "";
-        checkCode();
+        digits[i-1].focus();
+        digits[i-1].value = "";
+        joinBtn.disabled = true;
       }
     });
   });
-
-  function checkCode() {
-    joinBtn.disabled = digits.map(d => d.value).join("").length < 4;
-  }
 
   joinBtn.addEventListener("click", () => {
     const code = digits.map(d => d.value).join("");
     if (code.length === 4) connect(code);
   });
 
-  function chName(code) { return `slideremote-${code}`; }
-
-  async function ablyGet(code, fromSerial) {
-    const ch = encodeURIComponent(chName(code));
-    const url = fromSerial
-      ? `https://rest.ably.io/channels/${ch}/messages?limit=10&fromSerial=${encodeURIComponent(fromSerial)}&direction=forwards`
-      : `https://rest.ably.io/channels/${ch}/messages?limit=3&direction=backwards`;
-    const res = await fetch(url, { headers: { "Authorization": "Basic " + btoa(ABLY_API_KEY) } });
-    if (!res.ok) return [];
-    return await res.json();
-  }
-
-  async function ablyPost(code, data) {
-    const ch = encodeURIComponent(chName(code));
-    await fetch(`https://rest.ably.io/channels/${ch}/messages`, {
-      method: "POST",
-      headers: { "Authorization": "Basic " + btoa(ABLY_API_KEY), "Content-Type": "application/json" },
-      body: JSON.stringify({ data: JSON.stringify(data) })
-    });
-  }
-
-  async function connect(code) {
+  // ── Connect using Ably realtime (WebSocket-based, instant delivery) ──
+  function connect(code) {
     roomCode = code;
     joinBtn.disabled = true;
     joinBtn.textContent = "Connecting...";
     joinError.textContent = "";
 
-    try {
-      const msgs = await ablyGet(code, null);
-      lastSerial = msgs.length > 0 ? (msgs[0].serial || msgs[0].id) : null;
-    } catch (e) {
-      joinError.textContent = "Connection error. Check your internet.";
-      joinBtn.disabled = false;
-      joinBtn.textContent = "Connect";
-      return;
-    }
+    // Tear down any previous connection
+    if (ablyClient) { try { ablyClient.close(); } catch(e){} }
 
-    await ablyPost(code, { type: "phone-hello" });
+    ablyClient = new Ably.Realtime({ key: ABLY_API_KEY, clientId: "phone" });
+    channel = ablyClient.channels.get(`slideremote-${code}`);
 
-    const start = Date.now();
-    const shake = setInterval(async () => {
-      try {
-        const msgs = await ablyGet(code, lastSerial);
-        for (const msg of msgs) {
-          lastSerial = msg.serial || msg.id;
-          const data = typeof msg.data === "string" ? JSON.parse(msg.data) : msg.data;
-          if (data.type === "pc-ack" || data.type === "pc-online") {
-            clearInterval(shake);
-            showRemote(code);
-            return;
-          }
-        }
-      } catch (e) {}
-      if (Date.now() - start > 7000) {
-        clearInterval(shake);
-        joinError.textContent = "No PC found with that code. Is the extension running?";
+    let handshakeDone = false;
+    let handshakeTimer = null;
+
+    // Subscribe before publishing so we never miss the pc-ack
+    channel.subscribe(msg => {
+      const data = typeof msg.data === "string" ? JSON.parse(msg.data) : msg.data;
+
+      if (!handshakeDone && (data.type === "pc-ack" || data.type === "pc-online")) {
+        handshakeDone = true;
+        clearTimeout(handshakeTimer);
+        showRemote();
+        return;
+      }
+    });
+
+    // Wait until actually subscribed before sending hello
+    channel.attach(err => {
+      if (err) {
+        joinError.textContent = "Connection error. Check your internet.";
         joinBtn.disabled = false;
         joinBtn.textContent = "Connect";
+        return;
       }
-    }, 700);
+
+      // Tell PC we're here
+      channel.publish("msg", JSON.stringify({ type: "phone-hello" }));
+
+      // If no pc-ack within 7s, assume wrong code
+      handshakeTimer = setTimeout(() => {
+        if (!handshakeDone) {
+          joinError.textContent = "No PC found with that code. Is the extension running?";
+          joinBtn.disabled = false;
+          joinBtn.textContent = "Connect";
+          channel.unsubscribe();
+        }
+      }, 7000);
+    });
+
+    // Show connection drop after handshake
+    ablyClient.connection.on("disconnected", () => { if (connected) setConnStatus(false); });
+    ablyClient.connection.on("connected",    () => { if (connected) setConnStatus(true); });
   }
 
-  function showRemote(code) {
-    joinScreen.style.display = "none";
-    remoteScreen.style.display = "flex";
+  function showRemote() {
     connected = true;
+    joinScreen.style.display  = "none";
+    remoteScreen.style.display = "flex";
     setConnStatus(true);
-    pollInterval = setInterval(async () => {
-      try {
-        const msgs = await ablyGet(code, lastSerial);
-        for (const msg of msgs) lastSerial = msg.serial || msg.id;
-      } catch (e) { setConnStatus(false); }
-    }, 900);
   }
 
   function setConnStatus(ok) {
-    connDot.className = ok ? "conn-dot" : "conn-dot off";
+    connDot.className   = ok ? "conn-dot" : "conn-dot off";
     connLabel.textContent = ok ? "Connected" : "Disconnected";
   }
 
-  async function sendCommand(action, slideNumber) {
-    if (!connected || !roomCode) return;
-    await ablyPost(roomCode, { type: "command", action, slideNumber });
+  function sendCommand(action, slideNumber) {
+    if (!connected || !channel) return;
+    channel.publish("msg", JSON.stringify({ type: "command", action, slideNumber }));
     triggerFlash();
   }
 
@@ -524,14 +506,14 @@
     const val = parseInt(document.getElementById("gotoInput").value);
     if (val > 0) { sendCommand("goto", val); document.getElementById("gotoInput").value = ""; }
   });
-  document.getElementById("gotoInput").addEventListener("keydown", (e) => {
+  document.getElementById("gotoInput").addEventListener("keydown", e => {
     if (e.key === "Enter") document.getElementById("gotoBtn").click();
   });
   document.getElementById("disconnectBtn").addEventListener("click", () => {
-    clearInterval(pollInterval); pollInterval = null;
-    connected = false; roomCode = null; lastSerial = null;
+    connected = false; roomCode = null;
+    if (ablyClient) { try { ablyClient.close(); } catch(e){} ablyClient = null; channel = null; }
     remoteScreen.style.display = "none";
-    joinScreen.style.display = "flex";
+    joinScreen.style.display   = "flex";
     joinBtn.textContent = "Connect"; joinBtn.disabled = false;
     digits.forEach(d => d.value = ""); digits[0].focus();
   });
